@@ -369,6 +369,7 @@ class UserInput:
     def name(self) -> str:
         return "{} {}".format(self.first_name, self.last_name)
 
+
 class GPGInputData:
     """
     Contents for GPG master/sub keys generation. This is required
@@ -903,8 +904,6 @@ class GPGManager(BashMixin):
         logger.info("{}: [OK] Cleaned all temporary files")
 
 
-
-
 class YubiHandler:
     """
     YubiHandler is the main class of YubiResetor script.
@@ -1040,11 +1039,13 @@ def gen_passphrase() -> str:
         "".join(random.choice(PASS_CHARS) for i in range(PASS_LENGTH))
     )
 
+
 def welcome() -> None:
     print("\n\n{}\n\n".format("=" * 100))
     print("Welcome to the YubiKey Resetor script\n")
     print("* sudo password may be required")
     print("\n\n{}\n\n".format("=" * 100))
+
 
 def main():
     logger.setLevel(LOGLEVEL)
