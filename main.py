@@ -901,3 +901,209 @@ class GPGManager(BashMixin):
         logger.debug("{}: Killing gpg agent".format(self.__str__()))
         _ = self.command(["gpgconf", "--kill", "gpg-agent"])
         logger.info("{}: [OK] Cleaned all temporary files")
+
+
+
+
+class YubiHandler:
+    """
+    YubiHandler is the main class of YubiResetor script.
+    It handles the GPGManager class functionalitties in order
+    to make the script more verbose and easily understandable.
+    Available methods/properties:
+
+    :property yubi_id: The plugged in yubikey's id
+    :type yubi_id: str
+
+    :property master_key_id: The fingerprint of the master key
+    :type master_key_id: str
+
+    :method gen_master_key: Generates a master key
+    :returns: None
+
+    :method gen_sub_key: Generates 3 sub keys for the master
+    :returns: None
+
+    :method get_pub_key: Gets the exported public key for user
+    :returns: str
+
+    :method reset: Resets the given card
+    :returns: None
+
+    :method config: Reconfigures the given card after reset
+    :returns: None
+    """
+    def __init__(self) -> None:
+        self.gpg = GPGManager()
+
+    def __str__(self) -> str:
+        return "<YubikeyInfoHandler>"
+
+    @property
+    def yubi_id(self) -> str:
+        _yid: List[str] = []
+        args_list: list[str] = ["ykman", "info"]
+
+        logger.debug(
+            "{}: Fetching yubikey id with:: [ykman info]".format(self.__str__())
+        )
+        _yinfo = self.gpg.command(args_list, ignore_stderr=True)
+
+        if _yinfo:
+            _lines = [line.strip(" ") for line in _yinfo.split("\n")]
+            _yid = [
+                line.replace(" ", "").replace("Serialnumber:", "")
+                for line in _lines
+                if line.replace(" ", "").startswith("Serialnumber:")
+            ]
+
+        if not _yid:
+            raise YubiKeyIDNotFoundError("{}: Command {}: Yubikey ID not found".format(
+                    self.__str__(), " ".join(args_list)
+                )
+            )
+        return _yid[0]
+
+    @property
+    def master_key_id(self) -> str:
+        return self.gpg.get_master_key_id()
+
+    def gen_master_key(
+        self, name: str, email: str, comment: str, passphrase: str
+    ) -> None:
+        """Generates master key for yubikey"""
+        logger.debug("{}: Genereting Master key with gpg2 --full-gen-key!".format(
+            self.__str__()
+        ))
+        _ = self.gpg.create_master_key(
+            name, email, comment, passphrase, self.gpg.full_path(INPUT_DATA_NAME)
+        )
+        logger.info("{}: [OK] Master key generated!".format(self.__str__()))
+
+    def gen_sub_key(
+        self,
+        passphrase: str,
+        fingerprint: str,
+        key_type: str,
+        key_length: str,
+        key_usage: str,
+        key_expiry: str
+    ) -> None:
+        """Generates subkey for given key ID"""
+        logger.debug("{}: Genereting subkey {} for fingerprint: {}".format(
+            self.__str__(), key_usage, fingerprint
+        ))
+        _ = self.gpg.create_sub_key(
+            fingerprint,
+            passphrase,
+            self.gpg.full_path(GPG_HOME),
+            key_type,
+            key_length,
+            key_usage,
+            key_expiry
+        )
+        logger.info("{}: [OK] Subkey key {} generated!".format(
+            self.__str__(), key_usage
+        ))
+
+    def get_pub_key(self, mail: str) -> str:
+        return self.gpg.export_pub_key(mail)
+
+    def reset(self) -> None:
+        _ = self.gpg.factory_reset()
+
+    def config(
+        self,
+        key_id:str,
+        passphrase: str,
+        pin: str,
+        admin_pin: str,
+        first_name: str,
+        last_name: str
+    ) -> str:
+        _ = self.gpg.reconfigure_card(pin, admin_pin, first_name, last_name)
+        _ = self.gpg.set_keys(key_id, passphrase, admin_pin)
+        return self.gpg.generate_ssh_key(key_id)
+
+    def is_valid(self, name: str) -> bool:
+        return self.gpg.check_status(name)
+
+
+def gen_passphrase() -> str:
+    """
+    Creates a random password which will be used as
+    passphrase to the new master key and as an input to create
+    the subkeys required.
+    """
+    logger.debug("<YubikeyScript>: Generating random passphrase")
+    return str(
+        "".join(random.choice(PASS_CHARS) for i in range(PASS_LENGTH))
+    )
+
+def welcome() -> None:
+    print("\n\n{}\n\n".format("=" * 100))
+    print("Welcome to the YubiKey Resetor script\n")
+    print("* sudo password may be required")
+    print("\n\n{}\n\n".format("=" * 100))
+
+def main():
+    logger.setLevel(LOGLEVEL)
+    handler.setLevel(LOGLEVEL)
+    logger.addHandler(handler)
+
+    # Welcome message to indicate user input
+    # and usage of sudo passsword
+    _ = welcome()
+
+    user = UserInput()
+    passphrase = gen_passphrase()
+
+    # Master key generation
+    yubi_handler = YubiHandler()
+    _ = yubi_handler.gen_master_key(user.name, user.mail, "None", passphrase)
+
+    # Sub keys generation
+    fingerprint = yubi_handler.master_key_id
+    _ = yubi_handler.yubi_id
+    for k in SUBKEYS_LIST:
+        _ = yubi_handler.gen_sub_key(
+            passphrase,
+            fingerprint,
+            k["key_type"],
+            k["key_length"],
+            k["key_usage"],
+            k["key_expiry"]
+        )
+
+    # Card reset and re-configuration
+    for attempt in range(1, MAX_RETRIES + 1):
+        if attempt > 1:
+            logger.warning(
+                "<YubikeyScript>: Card not properly reset. Attempt [{}/{}]".format(
+                    attempt, MAX_RETRIES
+                )
+            )
+        _ = yubi_handler.reset()
+        _ = yubi_handler.config(
+            fingerprint,
+            passphrase,
+            user.pin,
+            user.admin_pin,
+            user.first_name,
+            user.last_name
+        )
+
+        if yubi_handler.is_valid(user.name):
+            break
+
+    if yubi_handler.is_valid(user.name):
+        # Public key export
+        pub_key = yubi_handler.get_pub_key(user.mail)
+        logger.info("<YubikeyScript>: GPG Keys generated, Yubikey set!")
+        logger.info("<YubikeyScript>: Your public key is::\n{}".format(pub_key))
+    else:
+        logger.error("<YubikeyScript>: Yubikey reset failed")
+
+
+if __name__ == "__main__":
+    main()
