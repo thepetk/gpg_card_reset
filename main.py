@@ -368,3 +368,536 @@ class UserInput:
     @property
     def name(self) -> str:
         return "{} {}".format(self.first_name, self.last_name)
+
+class GPGInputData:
+    """
+    Contents for GPG master/sub keys generation. This is required
+    for --batch mode creation of master key and sub keys. Batch is
+    used from gpg2 for unattended key generation. More information
+
+    https://gnupg.org/documentation/manuals/gnupg-2.0/Unattended-GPG-key-generation.html
+
+    Inside the gpg input data we are defining:
+    :param name: Name of the user
+    :type name: str
+
+    :param email: Email of the user
+    :type email: str
+
+    :param comment: Comment of the user
+    :type comment: str (default "None")
+
+    :param ktype: One of 1 - ('RSA'), 2 - ('DSA'), 3 - ('ELG-E')
+    :type ktype: str (default: RSA)
+
+    :param klength: Length of key
+    :type klength: int (default: 4096)
+
+    :param expiry: Expiry date of key
+    :type expiry: str (default: 5y)
+
+    :param passphrase: Key's passhprase
+    :type passphrase: str
+    """
+    def __init__(
+        self,
+        name: str = "",
+        email: str = "",
+        comment: str = "",
+        ktype: Optional[int] = None,
+        klength: Optional[int] = None,
+        expiry: Optional[str] = None,
+        passphrase: Optional[str] = None,
+    ) -> None:
+
+        self.name = name
+        self.email = email
+        self.comment = comment
+        self.passphrase = passphrase
+        self.ktype = ktype if ktype is not None else DEFAULT_KEY_TYPE
+        self.klength = klength if klength is not None else DEFAULT_KEY_LENGTH
+        self.expiry = expiry if expiry is not None else DEFAULT_KEY_EXPIRY
+
+    def __str__(self) -> str:
+        return "<GPGInputdata>"
+
+    @property
+    def template(self) -> str:
+        return DEFAULT_KEY_FILE_TMPL.format(
+            ktype=self.ktype,
+            klength=self.klength,
+            name=self.name,
+            email=self.email,
+            comment=self.comment,
+            expiry=self.expiry,
+            passphrase=self.passphrase
+        )
+
+    def to_file(self, path: str) -> None:
+        """
+        Creates a temporary file to the filesystem
+        After script's execution it cleans this file
+        """
+        logger.debug("{}: Creating temporary file:: {}".format(
+                self.__str__(), path
+            )
+        )
+        f = open(path, "w")
+        f.write(self.template)
+        f.close()
+        logger.debug("{}: Created temporary file:: {}".format(
+            self.__str__(), self.template
+        ))
+
+
+@dataclass
+class GPGCardCommand:
+    expect: Optional[Union[List[str], str]] = None
+    response: Optional[str] = None
+    mode: Literal["admin", "pass", "normal"] = "normal"
+    passphrase: bool = False
+    sleep: int = 0
+    log: Optional[str] = None
+
+
+class GPGCardManager:
+    """
+    The GPGCardManager is responsible for the update and reset
+    of the card (Yubikey for example). It accepts a list of
+    GPGCardCommand instances in order to interact with the card
+
+    The interact method spawns a pexpect child in order to automate
+    the interactive dialog that --card-edit of gpg2 command has.
+    It separates the GPGCommand in three methods:
+
+    - _set_deafult_passphrase: Sets default passphrase for the given key
+                               mostly used to import keys inside the card
+
+    - _access_admin: Handles the interactive dialog for accessing the
+                     admin mode of gpg2 --card-edit command
+
+    - _normal: All other commands are handled through _normal method
+    """
+    def __init__(self) -> None:
+        self._process = None
+        self._DEFAULT_PASS = "12345678"
+        self._MODEMAP: Dict[Literal["admin", "pass", "normal"], Callable] = {
+            "admin": self._access_admin,
+            "pass": self._set_default_passphrase,
+            "normal": self._normal
+        }
+    def __str__(self) -> str:
+        return "<GPGCardManager>"
+
+    def _spawn(self, command: str, timeout: int) -> Any:
+        return pexpect.spawn(
+            command, timeout=timeout, encoding=PEXPECT_ENCODING
+        )
+
+    def _set_default_passphrase(
+        self, expect: Optional[Union[List[str], str]] = None, response: Optional[str] = None
+    ) -> None:
+        assert expect is None and response is None
+
+        _exc = self._process.expect(["gpg/card>", "passphrase"])
+        if not _exc:
+            _ = self._process.sendline(self._DEFAULT_PASS)
+            _ = self._process.expect("gpg/card>")
+
+    def _access_admin(self, expect: Optional[Union[List[str], str]], response: str) -> None:
+        _ = self._process.expect(expect)
+        _ = self._process.sendline(response)
+        _ret = self._process.expect(
+            ["Admin commands are allowed", "Admin commands are not allowed"]
+        )
+        if not _ret == 0:
+            _ = self._process.sendline(response)
+            _ = self._process.expect(expect)
+
+    def _normal(self, expect: Optional[Union[List[str], str]], response: Optional[str]) -> None:
+        if not response is None and self._process:
+            _ = (
+                self._process.expect(expect)
+                if expect is not None else None
+            )
+            _ = (
+                self._process.sendline(response)
+                if response is not None else None
+            )
+
+    def _handle_mode(self, gpgcc: GPGCardCommand) -> None:
+        return self._MODEMAP[gpgcc.mode](gpgcc.expect, gpgcc.response)
+
+    def interact(
+        self,
+        command: str,
+        gpgccs: List[GPGCardCommand],
+        timeout: int = PEXPECT_TIMEOUT
+    ) -> None:
+        self._process = self._spawn(command, timeout)
+        try:
+            for gpgcc in gpgccs:
+                _ = self._handle_mode(gpgcc)
+
+                if gpgcc.log:
+                    logger.info("{}: {}".format(self.__str__(), gpgcc.log))
+
+                if gpgcc.sleep:
+                    time.sleep(gpgcc.sleep)
+        except pexpect.exceptions.TIMEOUT:
+            logger.warning("{}: pexpect timeout reached".format(self.__str__()))
+
+
+class GPGManager(BashMixin):
+    """
+    The GPGManager is an abstraction over BashMixin and GPGCardManager.
+    It includes its own functionality regarding the master and sub keys
+    generation.
+
+    On its initialization, initializes BashMixin, so it sets the environment
+    of the script (by creating all the necessary directorys etc). Then,
+    it kills all the pre-existing agents of gpg2. Finally it creates
+    a GPGCardManager instance to handle all card-edit commands
+    """
+    def __init__(self):
+        super().__init__()
+        _ = self._kill_agents()
+
+        self.card = GPGCardManager()
+
+    def _kill_agents(self) -> None:
+        logger.info("{}: Generate Master/Sub keys:: Killing all active previous gpg-agents".format(
+            self.__str__()
+        ))
+        _ = self.command(["gpgconf", "--kill", "gpg-agent"])
+
+    def _clean(self, path: str) -> None:
+        logger.debug("{}: Cleaning temporary file:: {}".format(
+            self.__str__(), path
+        ))
+        _ = self.command(["rm", path])
+
+    def create_master_key(
+        self,
+        name: str,
+        email: str,
+        comment: str,
+        passphrase: str,
+        path: str = "",
+        ktype: Optional[str] = None,
+        klength: Optional[str] = None,
+        expiry: Optional[str] = None,
+    ) -> None:
+        """
+        Temporary creates a file called input_data
+        containing all information for the gpg key.
+        Then it creates a gpg key with the given data
+        and cleans the temp created file.
+        """
+        _ = GPGInputData(
+            name=name,
+            email=email,
+            comment=comment,
+            ktype=ktype,
+            klength=klength,
+            expiry=expiry,
+            passphrase=passphrase
+        ).to_file(path)
+
+        _ = self.command(
+            [
+                "gpg2",
+                "--full-gen-key",
+                "--pinentry-mode=loopback",
+                "--expert",
+                "--batch",
+                path
+            ], ignore_stderr=True
+        ) 
+
+        self._clean(path)
+
+    def create_sub_key(
+        self,
+        uid: str,
+        passphrase: str,
+        homedir: str,
+        ktype: Optional[str] = None,
+        klength: Optional[str] = None,
+        kusage: Optional[str] = None,
+        expiry: Optional[str] = None,
+    ) -> None:
+
+        _ = self.command(
+            [
+                "gpg2",
+                "--homedir", homedir,
+                "--pinentry-mode=loopback",
+                "--batch",
+                "--passphrase", passphrase,
+                "--quick-add-key", uid,
+                "{}{}".format(ktype, klength),
+                kusage,
+                expiry
+            ],
+            ignore_stderr=True,
+        )
+
+    def get_master_key_id(self) -> str:
+        _kid: List[str] = []
+        args_list: List[str] = [
+            "gpg2", "-k", "--homedir", self.full_path(GPG_HOME)
+        ]
+
+        logger.debug("{}: Getting master key_id".format(self.__str__()))        
+        _key_info = self.command(args_list, ignore_stderr=True)
+
+        if _key_info:
+            _lines = [line.strip(" ") for line in _key_info.split("\n")]
+            _kid = [
+                _lines[i+1] for i in range(0, len(_lines))
+                if _lines[i].startswith("pub")
+            ]
+
+        if not _kid:
+            raise GPGKeyIDNotFoundError(
+                "{}: Command {}: KeyID not found".format(
+                    self.__str__(), " ".join(args_list)
+                )
+            )
+
+        return _kid[0]
+
+    def factory_reset(self) -> None:
+        logger.info(
+            "{}: Reseting Yubikey:: Fetching Card".format(self.__str__())
+        )
+        _ = self.card.interact(
+            " ".join(["gpg2", "--pinentry-mode=loopback", "--card-edit"]),
+            [
+                # Factory-reset apply
+                GPGCardCommand(
+                    expect="gpg/card>",
+                    response="admin",
+                    mode="admin",
+                ),
+                GPGCardCommand(expect=None, response="factory-reset"),
+                GPGCardCommand(expect="Continue?", response="y"),
+                GPGCardCommand(
+                    expect="reset?",
+                    response="yes",
+                    log="Reseting Yubikey:: Applying factory-reset",
+                    sleep=3
+                ),
+                GPGCardCommand(expect="gpg/card>", response=None),
+            ],
+            timeout=900
+        )
+
+    def reconfigure_card(
+        self,
+        pin: str,
+        admin_pin: str,
+        first_name: str,
+        last_name: str
+    ) -> None:
+        logger.info(
+            "{}: Reseting Yubikey:: Configure Card".format(self.__str__())
+        )
+        _ = self.card.interact(
+            " ".join(["gpg2", "--pinentry-mode=loopback", "--card-edit"]),
+            [
+                # Reset card interactive configuration
+                GPGCardCommand(
+                    expect="gpg/card>",
+                    response="admin",
+                    mode="admin",
+                ),
+                # Update cardholder's name
+                GPGCardCommand(expect=None, response="name"),
+                GPGCardCommand(expect="Cardholder's surname:", response=last_name),
+                GPGCardCommand(
+                    expect="Cardholder's given name:", response=first_name, sleep=1
+                ),
+                GPGCardCommand(expect=None, response="12345678"),
+                GPGCardCommand(expect="gpg/card>", response="passwd", sleep=2),
+                # Update pin
+                GPGCardCommand(expect="Your selection?", response="1", sleep=2),
+                GPGCardCommand(expect=None, response="123456"),
+                GPGCardCommand(expect=None, response=pin),
+                GPGCardCommand(expect=None, response=pin),
+                # Update admin pin
+                GPGCardCommand(expect="Your selection?", response="3", sleep=2),
+                GPGCardCommand(expect=None, response="12345678"),
+                GPGCardCommand(expect=None, response=admin_pin),
+                GPGCardCommand(expect=None, response=admin_pin),
+                # Exit
+                GPGCardCommand(expect="Your selection?", response="Q", sleep=2),
+                GPGCardCommand(expect=None, response="Q"),
+                GPGCardCommand(
+                    expect=["gpg/card>", pexpect.EOF, pexpect.TIMEOUT],
+                    response=None,
+                    sleep=2,
+                    log="Reseting Yubikey:: [OK] Admin PIN and PIN set"
+                )
+            ],
+            timeout=900
+        ),
+
+    def set_keys(self, key_id: str, passphrase: str, admin_pin: str) -> None:
+        logger.info(
+            "{}: Reseting Yubikey:: Importing keys to Yubikey".format(
+                self.__str__()
+            )
+        )
+        _ = self.card.interact(
+            " ".join(["gpg2", "--pinentry-mode=loopback", "--edit-key", key_id]),
+            [
+                # Signing Key Import
+                GPGCardCommand(expect="gpg>", response="key 1"),
+                GPGCardCommand(expect="gpg>", response="keytocard"),
+                GPGCardCommand(expect="Your selection?", response="1"),
+                GPGCardCommand(expect="Enter passphrase:", response=passphrase),
+                GPGCardCommand(expect="Enter passphrase:", response=admin_pin),
+                GPGCardCommand(expect="Enter passphrase:", response=admin_pin),
+                # Encryption Key Import
+                GPGCardCommand(expect="gpg>", response="key 1"),
+                GPGCardCommand(expect="gpg>", response="key 2"),
+                GPGCardCommand(expect="gpg>", response="keytocard"),
+                GPGCardCommand(expect="Your selection?", response="2"),
+                GPGCardCommand(expect="passphrase", response=passphrase),
+                GPGCardCommand(expect="passphrase", response=admin_pin),
+                # Authentication Key Import
+                GPGCardCommand(expect="gpg>", response="key 2"),
+                GPGCardCommand(expect="gpg>", response="key 3"),
+                GPGCardCommand(expect="gpg>", response="keytocard"),
+                GPGCardCommand(expect="Your selection?", response="3"),
+                GPGCardCommand(expect="passphrase", response=passphrase),
+                GPGCardCommand(expect="passphrase", response=admin_pin),
+                # Save
+                GPGCardCommand(
+                    expect="gpg>",
+                    response="save",
+                    log="Reseting Yubikey:: [OK] GPG keys imported to Yubikey"
+                ),
+            ],
+            timeout=15
+        ),
+
+    def check_status(self, name: str) -> bool:
+        logger.info(
+            "{}: Reseting Yubikey:: Checking status".format(
+                self.__str__()
+            )
+        )
+        _ret = self.command(["gpg2", "--card-status"])
+        for _line in _ret.splitlines():
+            for _k in ["signature key", "authentication key", "encryption key"]:
+                # all keys must be imported
+                if (
+                    _line
+                    and _k in _line.casefold()
+                    and "[none]" in _line.casefold()
+                ):
+                    return False
+            # Correct naming
+            if (
+                _line
+                and "name of cardholder" in _line
+                and not name in _line
+            ):
+                return False
+            # Correct pin retries counters
+            if (
+                _line
+                and "pin retry counter" in _line
+                and not("3 0 3" in _line or "3 3 3" in _line)
+            ):
+                return False
+
+        return True
+
+    def generate_revocation(self, last_name: str, passphrase: str, key_id: str) -> str:
+        logger.info(
+            "{}: Reseting Yubikey:: Generate revocation certificate".format(
+                self.__str__()
+            )
+        )
+        _ = self.card.interact(
+            " ".join(
+                [
+                    "gpg2",
+                    "--pinentry-mode=loopback",
+                    "--output",
+                    self.full_path(f"tmp/{last_name}_revoc.asc"),
+                    "--generate-revocation",
+                    key_id
+                ]
+            ),
+            [
+                GPGCardCommand(expect="this key?", response="y"),
+                # Revocation cert for Signing key
+                GPGCardCommand(expect="Your decision?", response="1"),
+                GPGCardCommand(expect="empty line:", response=" "),
+                GPGCardCommand(expect="this okay?", response="y"),
+                GPGCardCommand(
+                    expect="passphrase:",
+                    response=passphrase,
+                    sleep=1,
+                    log="Reseting Yubikey:: [OK] Revocation certificate generated"
+                ),
+            ]
+        )
+        _ret = self.command(["cat", self.full_path(f"tmp/{last_name}_revoc.asc")])
+        logger.debug(
+            "{}: Reseting Yubikey:: Revocation certificate - {}".format(
+                self.__str__(), _ret
+            )
+        )
+        return _ret
+
+    def export_pub_key(self, mail: str) -> str:
+        logger.info(
+            "{}: Reseting Yubikey:: Generate public key".format(
+                self.__str__()
+            )
+        )
+        p_key = self.command(["gpg2", "--armor", "--export", mail])
+        logger.debug(
+            "{}: Reseting Yubikey:: Public key - {}".format(
+                self.__str__(), p_key
+            )
+        )
+        logger.info(
+            "{}: Reseting Yubikey:: [OK] Public key exported".format(
+                self.__str__()
+            )
+        )
+        return p_key
+
+    def generate_ssh_key(self, key_id: str) -> str:
+        logger.info(
+            "{}: Reseting Yubikey:: Generate ssh key".format(
+                self.__str__()
+            )
+        )
+        s_key = self.command(["gpg2", "--export-ssh-key", key_id])
+        logger.debug(
+            "{}: Reseting Yubikey:: SSH key - {}".format(
+                self.__str__(), s_key
+            )
+        )
+        return s_key
+
+    def clean(self) -> str:
+        logger.info("{}: Cleaning temporary files".format(self.__str__()))
+        logger.debug("{}: Unmounting:: {}".format(self.__str__(), self.full_path("ram")))
+        _ = self.command(["sudo", "unmount", self.full_path("ram")])
+        
+        for _path in ["*.csv", "*.asc", "ram", "tmp"]:
+            logger.debug("{}: Removing:: {}".format(self.__str__(), self.full_path(_path)))
+            _ = self._clean(self.full_path(_path))
+        
+        logger.debug("{}: Killing gpg agent".format(self.__str__()))
+        _ = self.command(["gpgconf", "--kill", "gpg-agent"])
+        logger.info("{}: [OK] Cleaned all temporary files")
