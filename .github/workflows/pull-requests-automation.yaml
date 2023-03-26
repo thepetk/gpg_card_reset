@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/add-to-project@v0.4.1
         with:
-          project-url: https://github.com/orgs/users/thepetk/projects/1
+          project-url: https://github.com/users/thepetk/projects/1
           github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
           labeled: needs-review, lgtm
           label-operator: AND NOT
