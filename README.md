@@ -10,8 +10,8 @@ Its only dependency outside of python core modules, ```pexpect``` and is suppose
 ## Installation
 The simple ```makefile``` of the project indicates the ```install``` command with a simple installation of ```pexpect``` and the ```virtual environment``` needed by python to execute the script.
 
-```
-make installl
+```bash
+make install
 ```
 
 The above command is your solution and will do the trick!
